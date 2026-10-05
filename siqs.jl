@@ -37,6 +37,7 @@ mutable struct FBPrime
     root1::Int32
     root2::Int32
     logprime::UInt8
+    idx::Int32    # position in `QsState.fb_primes` (column of `bainv`)
 end
 
 """One SIQS polynomial Q(x) = a*x^2 + 2*b*x + c (b stored, 2b used in eval)."""
@@ -55,7 +56,7 @@ mutable struct PolyState
     c::BigInt
     b_list::Vector{BigInt}
     s::UInt32
-    afact::Set{Int32}
+    afact::Vector{Int32}    # sorted
 end
 
 mutable struct QsState
@@ -72,16 +73,15 @@ mutable struct QsState
     root_map::Vector{Tuple{UInt32,UInt32}}
     lp_found::Int
     large_prime_bound::UInt32
-    matrix::Vector{BigInt}
+    rel_rows::Vector{Vector{Int32}}   # per relation: sorted factor-base rows with odd exponent
     relations::Vector{BigInt}
     roots::Vector{BigInt}
-    partials::Dict{UInt64,Tuple{BigInt,Set{Int32},BigInt}}
-    ind::BigInt
+    partials::Dict{UInt64,Tuple{BigInt,Vector{Int32},BigInt}}
     sieve_values::Vector{UInt8}
-    bainv::Vector{Vector{Int32}}
+    bainv::Matrix{Int32}              # [fb_primes index, gray-code index]
     poly_a_list::Set{BigInt}
     fb_primes::Vector{FBPrime}
-    current_fb_primes::Vector{FBPrime}
+    active_fb::Vector{Int32}          # indices into fb_primes usable with the current `a`
     b1::Int
 end
 
@@ -96,27 +96,33 @@ end
     return UInt32(ndigits(x, base=2))
 end
 
-"""Test bit `k` (0-based) of a non-negative `BigInt`"""
-@inline function get_bit(x::BigInt, k::UInt32)::Bool
-    return ((x >> k) & BigInt(1)) != 0
-end
-
-"""Least-significant set-bit index, or -1 when `x == 0`.
-Mirrors `(x & -x).significant_bits() - 1` with the empty case giving -1.
-"""
-@inline function lsb_index(x::BigInt)::Int
-    iszero(x) && return -1
-    return Int(trailing_zeros(x))
-end
-
-"""Symmetric difference of two factor sets (mirrors `&a ^ &b` on hash sets)."""
-function symdiff_sets(a::Set{Int32}, b::Set{Int32})::Set{Int32}
-    out = Set{Int32}()
-    for v in a
-        v in b || push!(out, v)
+"""Symmetric difference of two sorted factor vectors (merge)"""
+function symdiff_sorted(a::Vector{Int32}, b::Vector{Int32})::Vector{Int32}
+    out = Vector{Int32}()
+    sizehint!(out, length(a) + length(b))
+    i = 1
+    j = 1
+    while i <= length(a) && j <= length(b)
+        x = a[i]
+        y = b[j]
+        if x < y
+            push!(out, x)
+            i += 1
+        elseif y < x
+            push!(out, y)
+            j += 1
+        else
+            i += 1
+            j += 1
+        end
     end
-    for v in b
-        v in a || push!(out, v)
+    while i <= length(a)
+        push!(out, a[i])
+        i += 1
+    end
+    while j <= length(b)
+        push!(out, b[j])
+        j += 1
     end
     return out
 end
@@ -310,11 +316,14 @@ function build_factor_base(qs_state::QsState, prime_list::Vector{UInt32})
             push!(factor_base, Int32(prime))
             qs_state.root_map[Int(prime)+1] = tonelli_shanks(qs_state.n, prime)
             if Int32(prime) >= qs_state.prime_limit
-                fbp = FBPrime(prime, Int32(0), Int32(0), UInt8(ndigits(prime, base=2) - 1))
+                fbp = FBPrime(prime, Int32(0), Int32(0), UInt8(ndigits(prime, base=2) - 1),
+                              Int32(length(qs_state.fb_primes) + 1))
                 push!(qs_state.fb_primes, fbp)
             end
         end
     end
+    # only sieved primes need b_j/a inverses; at most 40 a-factors
+    qs_state.bainv = zeros(Int32, length(qs_state.fb_primes), 40)
 
     factor_base_u128 = UInt128[UInt128(x) for x in factor_base[2:end]]
     factor_base_u64 = UInt64[UInt64(x) for x in factor_base[2:end]]
@@ -363,7 +372,7 @@ function generate_a(qs_state::QsState, factor_base::Vector{Int32})
     too_close = UInt32(10) #3
     close_range = UInt32(5) #10
     poly_a = BigInt(1)
-    afact = Set{Int32}()
+    afact = Int32[]
     qli = Int[]
 
     a1 = BigInt(0)
@@ -452,6 +461,7 @@ function generate_a(qs_state::QsState, factor_base::Vector{Int32})
     end
     push!(poly_a_list, poly_a)
     sort!(qli)
+    sort!(afact)
     return (poly_a, qli, afact)
 end
 
@@ -480,25 +490,23 @@ function generate_first_polynomial(qs_state::QsState,
     b = mod(sum(b_list), a)
     c = (b * b - qs_state.n) ÷ a
 
-    res = BigInt(0)
     for fbp in qs_state.fb_primes
         p = Int32(fbp.prime)
-        res = mod(a, BigInt(p))
-        iszero(res) && continue
+        iszero(bmod(a, p)) && continue
         p_u32 = UInt32(p)
         ainv = modinv(a, p)
         ainv2 = UInt64(mod(Int64(2) * Int64(ainv), Int64(p)))
 
         # store bainv
         for (j, b_val) in enumerate(b_list)
-            value = UInt64(mod(b_val, BigInt(p_u32)))
+            value = UInt64(bmod(b_val, p_u32))
             value = (value * ainv2) % UInt64(p)
-            bainv[Int(p)+1][j] = Int32(value)
+            bainv[Int(fbp.idx), j] = Int32(value)
         end
 
         # store roots
         (r1_val, r2_val) = qs_state.root_map[Int(p_u32)+1]
-        b_modp = UInt32(mod(b, BigInt(p_u32)))
+        b_modp = UInt32(bmod(b, p_u32))
         ainv_modp = UInt64(mod(Int64(ainv), Int64(p)))
 
         r1_modp = r1_val % p_u32
@@ -527,19 +535,12 @@ end
 # Fast trial division over the factor base
 # ----------------------------------------------------------------------------
 
-"""Toggle a prime's presence (tracks square-free parity)."""
-@inline function toggle_factor!(factors::Set{Int32}, f::Int32)
-    if f in factors
-        delete!(factors, f)
-    else
-        push!(factors, f)
-    end
-end
-
+"""Trial-divide `value` by the factor base. Returns the sorted primes with odd
+exponent (plus -1 for a negative value) and the unfactored cofactor."""
 function factorise_fast(value::BigInt, factor_base_u32::Vector{UInt32},
                         factor_base_u64::Vector{UInt64},
                         factor_base_u128::Vector{UInt128})
-    factors = Set{Int32}()
+    factors = Int32[]
 
     if value < 0
         push!(factors, Int32(-1))
@@ -551,10 +552,12 @@ function factorise_fast(value::BigInt, factor_base_u32::Vector{UInt32},
 
     while i <= length(factor_base_u32)
         factor = factor_base_u32[i]
-        while mod(value, BigInt(factor)) == 0
-            toggle_factor!(factors, Int32(factor))
+        cnt = 0
+        while bmod(value, factor) == 0
             value = value ÷ BigInt(factor)
+            cnt += 1
         end
+        isodd(cnt) && push!(factors, Int32(factor))
         i += 1
         if value < comp
             break
@@ -569,10 +572,12 @@ function factorise_fast(value::BigInt, factor_base_u32::Vector{UInt32},
 
     while i <= length(factor_base_u128)
         factor = factor_base_u128[i]
+        cnt = 0
         while val_u128 % factor == UInt128(0)
-            toggle_factor!(factors, Int32(factor))
             val_u128 = val_u128 ÷ factor
+            cnt += 1
         end
+        isodd(cnt) && push!(factors, Int32(factor))
         i += 1
         if val_u128 < UInt128(typemax(UInt64))
             break
@@ -587,10 +592,12 @@ function factorise_fast(value::BigInt, factor_base_u32::Vector{UInt32},
 
     while i <= length(factor_base_u64)
         factor = factor_base_u64[i]
+        cnt = 0
         while val_u64 % factor == UInt64(0)
-            toggle_factor!(factors, Int32(factor))
             val_u64 = val_u64 ÷ factor
+            cnt += 1
         end
+        isodd(cnt) && push!(factors, Int32(factor))
         i += 1
     end
 
@@ -603,27 +610,28 @@ end
 
 function generate_polynomials(qs_state::QsState, polynomials::Vector{Polynomial},
                               factor_base::Vector{Int32},
-                              grays::Vector{Tuple{Int,Int32}})::PolyState
-    empty!(qs_state.current_fb_primes)
+                              gray_cache::Dict{Int,Vector{Tuple{Int,Int32}}})::PolyState
+    empty!(qs_state.active_fb)
     empty!(polynomials)
     poly_state = generate_first_polynomial(qs_state, factor_base)
-    stop = 1 << (Int(poly_state.s) - 1)
+    s = Int(poly_state.s)
+    stop = 1 << (s - 1)
+    # the walk reads entries up to index stop+1, so build the table for s+1
+    grays = get!(() -> get_gray_code(s + 1), gray_cache, s)
 
     found = false
     for fbp in qs_state.fb_primes
-        pa = mod(poly_state.a, BigInt(fbp.prime))
-        if !iszero(pa)
-            push!(qs_state.current_fb_primes,
-                  FBPrime(fbp.prime, fbp.root1, fbp.root2, fbp.logprime))
+        if bmod(poly_state.a, fbp.prime) != 0
+            push!(qs_state.active_fb, fbp.idx)
         end
         if !found && fbp.prime > (qs_state.m * UInt32(2) + UInt32(1))
             found = true
-            qs_state.b1 = length(qs_state.current_fb_primes) - 1  # keep 0-based
+            qs_state.b1 = length(qs_state.active_fb) - 1  # keep 0-based
         end
     end
 
     if !found
-        qs_state.b1 = length(qs_state.current_fb_primes)
+        qs_state.b1 = length(qs_state.active_fb)
     end
 
     (v, e) = grays[2]
@@ -693,7 +701,7 @@ function find_relations(qs_state::QsState, fb_map::Dict{Int32,Int},
             (local_factors, finval) = factorise_fast(poly_val, factor_base_u32,
                                                      factor_base_u64,
                                                      factor_base_u128)
-            local_factors = symdiff_sets(local_factors, poly_state.afact)
+            local_factors = symdiff_sorted(local_factors, poly_state.afact)
 
             # Handle large primes and partial relations.
             if finval != 1
@@ -702,7 +710,7 @@ function find_relations(qs_state::QsState, fb_map::Dict{Int32,Int},
                     if haskey(qs_state.partials, value)
                         (rel, lf, pv) = qs_state.partials[value]
                         relation = relation * rel
-                        local_factors = symdiff_sets(local_factors, lf)
+                        local_factors = symdiff_sorted(local_factors, lf)
                         pva = pva * pv
                         qs_state.lp_found += 1
                     else
@@ -714,12 +722,7 @@ function find_relations(qs_state::QsState, fb_map::Dict{Int32,Int},
                 end
             end
 
-            for fac in local_factors
-                idx = fb_map[fac]
-                qs_state.matrix[idx] = qs_state.matrix[idx] | qs_state.ind
-            end
-
-            qs_state.ind <<= 1
+            push!(qs_state.rel_rows, Int32[fb_map[fac] for fac in local_factors])
             push!(qs_state.relations, relation)
             push!(qs_state.roots, pva)
 
@@ -739,17 +742,17 @@ function interval_sieve(qs_state::QsState, v::Int, e::Int32, interval_size::Int)
     sieve_values = qs_state.sieve_values
     bainv = qs_state.bainv
 
-    # split current_fb_primes at b1 (0-based)
+    # split active_fb at b1 (0-based)
     #   cur_fb1 = indices 1..b1, cur_fb2 = indices (b1+1)..end.
-    for idx in 1:length(qs_state.current_fb_primes)
-        fbp = qs_state.current_fb_primes[idx]
+    for idx in 1:length(qs_state.active_fb)
+        fbp = qs_state.fb_primes[qs_state.active_fb[idx]]
         p = Int(fbp.prime)
         p_i32 = Int32(p)
 
         r1 = Int(fbp.root1)
         r2 = Int(fbp.root2)
         log_p = fbp.logprime
-        ebainv = Int(bainv[p+1][v+1]) * Int(e)
+        ebainv = Int(bainv[Int(fbp.idx), v+1]) * Int(e)
         fbp.root1 = Int32(mod(r1 - ebainv, p))
         fbp.root2 = Int32(mod(r2 - ebainv, p))
 
@@ -801,11 +804,9 @@ function sieve(qs_state::QsState, factor_base::Vector{Int32},
     threshold = UInt8(clamp(threshold_f, 0.0, 255.0))
     bound = UInt8(0x80) - threshold
 
-    qs_state.matrix = [BigInt(0) for _ in 1:fb_len]
-
     num_poly = UInt32(0)
     interval_size = Int(2 * qs_state.m + UInt32(1))
-    grays = get_gray_code(20)
+    gray_cache = Dict{Int,Vector{Tuple{Int,Int32}}}()
 
     qs_state.sieve_values = fill(bound, interval_size)
 
@@ -819,7 +820,7 @@ function sieve(qs_state::QsState, factor_base::Vector{Int32},
             end
         end
         ft = false
-        poly_state = generate_polynomials(qs_state, polynomials, factor_base, grays)
+        poly_state = generate_polynomials(qs_state, polynomials, factor_base, gray_cache)
         for ppoly in polynomials
             interval_sieve(qs_state, ppoly.v, ppoly.e, interval_size)
             find_relations(qs_state, fb_map, interval_size, poly_state, ppoly,
@@ -838,57 +839,75 @@ end
 # Null-space extraction (Gaussian elimination over GF(2))
 # ----------------------------------------------------------------------------
 
-function null_space_extraction(qs_state::QsState)::Vector{BigInt}
+"""Dependencies among the relations as packed bit vectors (bit `r-1` of word
+`(r-1)>>6+1` is relation `r`). `m` is the factor-base size (matrix rows)."""
+function null_space_extraction(qs_state::QsState, m::Int)::Vector{Vector{UInt64}}
     n = length(qs_state.relations)
-    m = length(qs_state.matrix)
+    nw = cld(n, 64)
     t = Int(qs_state.t)
 
-    matrix = qs_state.matrix
-    marks = Int[]
-    mark_mask = BigInt(0)
-    cur = -1
+    # column j of `mat` is row j of the GF(2) matrix: bit r set when
+    # relation r has an odd exponent of factor-base prime j
+    mat = zeros(UInt64, nw, m)
+    for (r, rows) in enumerate(qs_state.rel_rows)
+        w = ((r - 1) >> 6) + 1
+        bit = UInt64(1) << ((r - 1) & 63)
+        for i in rows
+            mat[w, i] |= bit
+        end
+    end
 
+    pivot_of_row = fill(-1, m)
     for i in 1:m
         if qs_state.verbose
-            if cur % 10 == 0
-                print("$(cur), $(m)\r")
+            if (i - 1) % 10 == 0
+                print("$(i - 1), $(m)\r")
             end
         end
-        cur += 1
-        lsb = lsb_index(matrix[i])
-        if lsb == -1
-            continue
+        # lowest set bit of this row
+        lsb = -1
+        for w in 1:nw
+            x = mat[w, i]
+            if x != 0
+                lsb = (w - 1) * 64 + trailing_zeros(x)
+                break
+            end
         end
-        push!(marks, n - lsb - 1)
-        mark_mask = mark_mask | (BigInt(1) << lsb)
+        lsb == -1 && continue
+        pivot_of_row[i] = lsb
 
-        pivot_row = matrix[i]
-        for j in 1:m
-            if get_bit(matrix[j], UInt32(lsb)) && Int(j) - 1 != cur
-                matrix[j] = xor(matrix[j], pivot_row)
+        pw = (lsb >> 6) + 1
+        pbit = UInt64(1) << (lsb & 63)
+        # words below `pw` of the pivot row are zero, nothing to xor there
+        @inbounds for j in 1:m
+            if j != i && (mat[pw, j] & pbit) != 0
+                for k in pw:nw
+                    mat[k, j] ⊻= mat[k, i]
+                end
             end
         end
     end
 
-    sort!(marks)
-    nulls = BigInt[]
-    mark_set = Set(marks)
-    free_cols = Int[val for val in 0:(n-1) if !(val in mark_set)]
-    k = 0
-    for col in free_cols
-        shift = n - col - 1
-        val = BigInt(1) << shift
-        fin = val
+    is_pivot = falses(n)
+    for lsb in pivot_of_row
+        lsb >= 0 && (is_pivot[lsb + 1] = true)
+    end
+
+    nulls = Vector{Vector{UInt64}}()
+    for f in (n - 1):-1:0
+        is_pivot[f + 1] && continue
+        vec = zeros(UInt64, nw)
+        vec[(f >> 6) + 1] |= UInt64(1) << (f & 63)
+        fw = (f >> 6) + 1
+        fbit = UInt64(1) << (f & 63)
         for i in 1:m
-            if get_bit(matrix[i], UInt32(shift))
-                fin = fin | (matrix[i] & mark_mask)
+            piv = pivot_of_row[i]
+            if piv >= 0 && (mat[fw, i] & fbit) != 0
+                vec[(piv >> 6) + 1] |= UInt64(1) << (piv & 63)
             end
         end
-        push!(nulls, fin)
-        k += 1
-        if k == t
-            break
-        end
+        push!(nulls, vec)
+        length(nulls) == t && break
     end
     return nulls
 end
@@ -897,18 +916,14 @@ end
 # Factor extraction from null-space dependencies
 # ----------------------------------------------------------------------------
 
-function extract_factors(qs_state::QsState, nulls::Vector{BigInt},
+function extract_factors(qs_state::QsState, nulls::Vector{Vector{UInt64}},
                          original_n::BigInt)
     n = length(qs_state.relations)
-    bit = BigInt(0)
     for vector in nulls
-        v = vector
         prod_right = BigInt(1)
         prod_left = BigInt(1)
         for idx in 1:n
-            bit = v & BigInt(1)
-            v >>= 1
-            if bit == 1
+            if (vector[((idx - 1) >> 6) + 1] >> ((idx - 1) & 63)) & UInt64(1) == 1
                 prod_left *= qs_state.relations[idx]
                 prod_right *= qs_state.roots[idx]
             end
@@ -962,7 +977,7 @@ function qsfactor(qs_state::QsState)::Tuple{BigInt,BigInt}
     if qs_state.verbose @printf("Step 3 (Sieving) took %.3f seconds\n", step_end) end
 
     step_start = time()
-    nulls = null_space_extraction(qs_state)
+    nulls = null_space_extraction(qs_state, length(factor_base))
     step_end = time() - step_start
     if qs_state.verbose @printf("Step 4 (Null Space Extraction) took %.3f seconds\n", step_end) end
 
@@ -1046,21 +1061,20 @@ function factor(nn::BigInt, verbose::Bool=false)::Tuple{BigInt,BigInt}
     root_map = fill((UInt32(0), UInt32(0)), Int(b) + 1)
     lp_found = 0
     large_prime_bound = UInt32(0)
-    matrix = BigInt[]
+    rel_rows = Vector{Int32}[]
     relations = BigInt[]
     roots = BigInt[]
-    partials = Dict{UInt64,Tuple{BigInt,Set{Int32},BigInt}}()
-    ind = BigInt(1)
+    partials = Dict{UInt64,Tuple{BigInt,Vector{Int32},BigInt}}()
     sieve_values = UInt8[]
-    bainv = [zeros(Int32, 40) for _ in 1:(Int(b) + 1)]
+    bainv = zeros(Int32, 0, 0)   # sized in build_factor_base
     poly_a_list = Set{BigInt}()
     fb_primes = FBPrime[]
-    current_fb_primes = FBPrime[]
+    active_fb = Int32[]
 
     qs_state = QsState(nn, b, m, t, update_frequency, verbose, prime_limit, eps,
                     lp_multiplier, multiplier, root_map, lp_found, large_prime_bound,
-                    matrix, relations, roots, partials, ind, sieve_values, bainv,
-                    poly_a_list, fb_primes, current_fb_primes, 0)
+                    rel_rows, relations, roots, partials, sieve_values, bainv,
+                    poly_a_list, fb_primes, active_fb, 0)
                     
     qsfactor(qs_state)
 end
@@ -1070,12 +1084,10 @@ end
 # ----------------------------------------------------------------------------
 
 function main()
-    # uncomment for command line input
-    #if length(ARGS) > 0
-    #    nn  = parse(BigInt, ARGS[1])
-    #end
+    # usage: julia siqs.jl [number]
+    # the number given on the command line overrides the default below
 
-    # some test numbers, uncomment one to use along with the parse line
+    # some test numbers, uncomment one to use as the default
     #n = "490516739493812924575428019499" # 30 digits
     #n = "3009945328299388957931300315646308313419" # 40 digits
     #n = "32466092539065621597006224985875602441118457873449" # 50 digits
@@ -1085,7 +1097,7 @@ function main()
     #n = "32359223112252035483026442913476041867810505843753089370355888993328247493431081" # 80 digits
     #n = "210282352803628314297444623664410288223068234485244872675057323275627391582812832505918087" # 90 digits
     #n = "1522605027922533360535618378132637429718068114961380688657908494580122963258952897654000350692006139" # rsa-100
-    nn = parse(BigInt, n)
+    nn = parse(BigInt, length(ARGS) > 0 ? ARGS[1] : n)
 
     #=
     # next 3 lines will create a random semi-prime

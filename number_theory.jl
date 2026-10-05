@@ -163,14 +163,16 @@ end
 # Modular inverse
 # ----------------------------------------------------------------------------
 
+"""`x mod p` for a non-negative word-sized `p` without allocating (GMP `fdiv_ui`)"""
+@inline function bmod(x::BigInt, p::Integer)::Int
+    return Int(ccall((:__gmpz_fdiv_ui, Base.GMP.libgmp), Culong,
+                     (Ref{BigInt}, Culong), x, p))
+end
+
+# reduce to a machine int first so no BigInt is created; `invmod` throws if
+# the inverse does not exist
 function modinv(n::BigInt, p::Int32)::Int32
-    x = Int32(0)
-    try
-        x = invmod(n, p)
-    catch e
-        error("modinv(n,p), inverse does not exist")
-    end
-    x
+    return Int32(invmod(bmod(n, p), Int(p)))
 end
 
 # ----------------------------------------------------------------------------
